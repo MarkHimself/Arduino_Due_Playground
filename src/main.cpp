@@ -21,13 +21,20 @@
 	- Updating PWM
 */
 
-/* Set up digital output on digital pin 26.
-d.p. 26 = PIOD1
+/* Set up PWM on digital pin 38
+it is pin PIOC6
+PWM: peripheral B, PWML2 - PWM Channel 2 Output Low
+write 0 to 1000 for PWM control.
+	0 = Low
+	1000 = High
+	CPOL looks like it's used backwards.
+	Maybe because i'm using PWML and not PWMH
 */
 
-void reset_PIOD_Controlller();
-void set_PIOD1_Output();
-void set_PIOD1_State(bool ishigh);
+
+void reset_PWM_Controller();
+void setup_PIOC6_PWM();
+void write_PIOC6_PWM_Value(uint16_t val);
 
 
 uint32_t b[32];
@@ -36,51 +43,98 @@ uint32_t b[32];
 void setup() {
 	for (uint32_t i = 0; i < 32; i++) b[i] = (1u << i);
 	Serial.begin(9600);
-	reset_PIOD_Controlller();
-	set_PIOD1_Output();
+	reset_PWM_Controller();
+	setup_PIOC6_PWM();
 	
 }
 
 void loop() {
-	set_PIOD1_State(true);
-	//Serial.println("on");
-	delay(100);
-	set_PIOD1_State(false);
-	//Serial.println("off");
-	delay(100);
+	int delay_time = 50;
+	
+	write_PIOC6_PWM_Value(millis() % 1000);
+	
+	/*
+	write_PIOC6_PWM_Value(45);
+	delay(delay_time);
+	write_PIOC6_PWM_Value(950);
+	delay(delay_time);
+	write_PIOC6_PWM_Value(2);
+	delay(delay_time);
+	write_PIOC6_PWM_Value(995);
+	delay(delay_time);
+	write_PIOC6_PWM_Value(0);
+	delay(delay_time);
+	write_PIOC6_PWM_Value(500);	
+	delay(delay_time);
+	write_PIOC6_PWM_Value(1000);
+	delay(delay_time);
+	*/
 }
 
-void reset_PIOD_Controlller(){
-	// reset it
-	// HOW?
+void reset_PWM_Controller(){
+	// reset PWM
+	// how?
 	
-	// unlock it													pg. 630
-	PIOD->PIO_WPMR = (0x50494F << 8);	//							pg. 674
+	// clear write protect register
+	PIOC->PIO_WPMR = (0x50494F << 8);	// 							pg. 674
+	PWM->PWM_WPCR = 0x50574D << 8;		// pwm						pg. 1037
+	
+	// pioc instance 13
+	PMC->PMC_PCER0 = b[13];		// turn on clock for PIOC			pg. 542
+	
+	// pwm instance 36
+	PMC->PMC_PCER1 = b[4];		// turn on clock for PWM			pg. 563
+	
 }
 
-void set_PIOD1_Output(){
+void setup_PIOC6_PWM(){
 	
+	// disable pwm on channel 2
+	PWM->PWM_DIS = b[2];	// 										pg. 1008
+	
+	// *** Setup PIOC Pin to use PWM ***
 	// disable pull up resistor. through PIO_PUDR					pg. 622
-	PIOD->PIO_PUDR = b[1];	// 										pg. 653
+	PIOC->PIO_PUDR = b[6];	// 										pg. 653
+	// disable PIO control of PIOC
+	PIOC->PIO_PDR = b[6];	// 										pg. 634
+	// select peripheral B
+	PIOC->PIO_ABSR |= b[6];
 	
-	// pio enable/disable register									pg. 622
-	PIOD->PIO_PER = b[1];	// 										pg. 633
+	// *** setup pwm registers ***
 	
-	// output control												pg. 623
-	PIOD->PIO_OER = b[1];	//										pg. 636
+	// Not using CLKA, CLKB
+	PWM->PWM_CLK = 0;	// 											pg. 1006
 	
-	// set pin to LOW
-	PIOD->PIO_CODR = b[1];	// 										pg. 643
+	PWM->PWM_CH_NUM[2].PWM_CMR = 0 		// channel mode				pg. 1044
+		| 0b0011			// use: master_clock / 8
+		//| PWM_CMR_CPOL		// Start LOW at beginning of pulse
+		// i want it to start high, so not using CPOL.
+	;
+	
+	PWM->PWM_CH_NUM[2].PWM_CDTY = 0;	// duty cycle				pg. 1046
+	
+	// pwm comparisons.
+	PWM->PWM_CMP[2].PWM_CMPM = 0;
 	
 	
-	// power management id is 14 									pg. 38
-	PMC->PMC_PCER0 = b[14];			//								pg. 542
+	// pwm channel period will be 1000
+	PWM->PWM_CH_NUM[2].PWM_CPRD = 1000;		//						pg. 1048
+	
+	// enable PWM on channel 2
+	PWM->PWM_ENA = b[2];	// 										pg. 1007
 }
 
-void set_PIOD1_State(bool ishigh){
-	if (ishigh) PIOD->PIO_SODR = b[1];	// 							pg. 642
-	else PIOD->PIO_CODR = b[1];			// 							pg. 643
+void write_PIOC6_PWM_Value(uint16_t val){
+	if (val > 1000) val = 1000;
+	PWM->PWM_CH_NUM[2].PWM_CDTYUPD = val;
 }
+
+
+
+
+
+
+
 
 
 
