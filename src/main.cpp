@@ -1,4 +1,5 @@
 #include <Arduino.h>
+#include <cstdint>
 // Arduino Due
 // Do random stuff on it to learn it better.
 /*
@@ -21,182 +22,112 @@
 	- Updating PWM
 */
 
-/* Set up PWM on digital pin 38
-it is pin PIOC6
-PWM: peripheral B, PWML2 - PWM Channel 2 Output Low
-write 0 to 1000 for PWM control.
-	0 = Low
-	1000 = High
-	CPOL looks like it's used backwards.
-	Maybe because i'm using PWML and not PWMH
+/* Set up a timer to create a delay function.
+//	-UPDATE: The Datasheet refers to TC0 - TC8 as the timer + channel type of thing.
+	- in other words. to turn on the clock for TC2 Channel 1, you need TC7 (in PCER1) register.
+	- This is called BAD Documentation.
 
-Also, set up PWM on a High PWM Channel to see how CPOL looks like.
-digital pin 42 = PIOA19
-PWMH1
+PLAN
+Use waveform mode. disable clock (or just stop it) with an RC compare.
+When RC compare occurs, the delay time has passed by.
+Get the status from the status register.
 
-IMPORTANT INFO
--PWM duty cycle is how long the HIGH part of the PWM is on for.
-in other words, the HIGH part starts at beginning of pulse and then turns off.
-for PWML, CPOL = 0
-for PWMH, CPOL = 1
-- this is because PWML is inverted from PWMH
-- i guess the graph of page 980 is for PWMH
+OUTCOME:
+Looks like an accurate delay function.
 */
 
 
-void reset_PWM_Controller();
-void setup_PIOC6_PWM();
-void write_PIOC6_PWM_Value(uint16_t val);
+void reset_Timer_Controller();
+void setup_timer_for_ms_delay();
+void delay_ms(uint16_t val);
 
-void setup_PIOA19_PWM();
-void write_PIOA19_PWM_Value(uint16_t val);
 
 uint32_t b[32];
 
 
 void setup() {
-	for (uint32_t i = 0; i < 32; i++) b[i] = (1u << i);
-	Serial.begin(9600);
-	reset_PWM_Controller();
-	setup_PIOC6_PWM();
-	setup_PIOA19_PWM();
 	
+	for (uint32_t i = 0; i < 32; i++) b[i] = (1u << i);
+	Serial.begin(38400);
+	Serial.println("hi");
+	reset_Timer_Controller();
+	setup_timer_for_ms_delay();
 }
 
 void loop() {
-	int delay_time = 50;
+	//int delay_time = 50;
 	
-	//write_PIOC6_PWM_Value(millis() % 1000);
+	Serial.println("2000 in 1ms increments");
+	for (int i = 0; i < 2000; i++) delay_ms(1);
 	
-	write_PIOC6_PWM_Value(995);
-	write_PIOA19_PWM_Value(995);
+	Serial.println("2000");
+	delay_ms(2000);
 	
+	Serial.println("3000");
+	delay_ms(3000);
+	
+	Serial.println("8000");
+	delay_ms(8000);
+	
+	Serial.println("750");
+	delay_ms(750);
+	
+	Serial.println("100");
+	delay_ms(100);
+	
+}
+
+void reset_Timer_Controller(){
+	
+	// TC1 channel 0 is instance number 30										pg. 38
+	
+	// disable quad decoder
+	TC1->TC_BMR = 0;					// block mode register					pg. 901
+	TC1->TC_QIDR = 7;					// disabl quad decoder Interrupts		pg. 904
+	TC1->TC_FMR = 0;					// disable faults						pg. 907
+}
+
+void setup_timer_for_ms_delay(){
+	
+	// TC1 is instance number 28												pg. 38
+	PMC->PMC_PCER0 = b[30];			// enable clock to TC 1 channel 0			pg. 542
+	TC1->TC_WPMR = 0x54494D << 8;		// unlock write protect registers		pg. 908
+	
+	TC1->TC_CHANNEL[0].TC_CCR = b[1];	// disable the clock					pg. 880
+	TC1->TC_CHANNEL[0].TC_CMR = 0		// clear out capture/waveform mode		pg. 881
+		| TC_CMR_TCCLKS_TIMER_CLOCK1			// 42 MHz
+		| TC_CMR_WAVE							// select waveform mode.
+		| TC_CMR_CPCSTOP						// stop the clock when an RC comare occurs.
+		| TC_CMR_WAVSEL_UP						// count just up (no external trigger on rc compary)
+												// so it doesn't restart the clock.
+	;
+	TC1->TC_CHANNEL[0].TC_CCR = b[0];	// enable the clock						pg. 880
+	// consider checking the status register to ensure the clock is actually enabled.
+	// return true/false to know if it was set up successfully.
+}
+
+void delay_ms(uint16_t val){
+	uint32_t status_reg = 0;
+	
+	TC1->TC_CHANNEL[0].TC_RC = 42000 * val;			// count to RC = val.		pg. 891
 	/*
-	write_PIOC6_PWM_Value(45);
-	delay(delay_time);
-	write_PIOC6_PWM_Value(950);
-	delay(delay_time);
-	write_PIOC6_PWM_Value(2);
-	delay(delay_time);
-	write_PIOC6_PWM_Value(995);
-	delay(delay_time);
-	write_PIOC6_PWM_Value(0);
-	delay(delay_time);
-	write_PIOC6_PWM_Value(500);	
-	delay(delay_time);
-	write_PIOC6_PWM_Value(1000);
-	delay(delay_time);
+	f_clk = 42 MHz
+	delay 1 [ms] * (1 second / 1000 ms) * (42*10^6 / 1 second) = 42,000 ticks.
+	delay val [ms] = 42,000 * val ticks.
 	*/
+	
+	// software trigger reset the counter and starts counting (SWTRG in TC_CCR)	// pg. 862-863
+	TC1->TC_CHANNEL[0].TC_CCR = TC_CCR_SWTRG | b[0];	// start the counter			// pg. 880
+	
+	
+	// when timer overflows, COVFS is set in TC_SR register.					// pg. 860
+	// The CPCS bit is set when the timer reaches RC. that is what i'm using.
+	
+	while (	!((status_reg = TC1->TC_CHANNEL[0].TC_SR) & TC_SR_CPCS) ){				// pg. 892
+		// wait until the timer/counter value equals TC_RC.
+		// when compare occurs, the clock will be stopped.
+	}
 }
-
-void reset_PWM_Controller(){
-	// reset PWM
-	// how?
-	
-	// clear write protect register
-	PIOC->PIO_WPMR = (0x50494F << 8);	// 							pg. 674
-	PIOA->PIO_WPMR = (0x50494F << 8);	// 							pg. 674
-	PWM->PWM_WPCR = 0x50574D << 8;		// pwm						pg. 1037
-	
-	// pioc instance 13
-	PMC->PMC_PCER0 = b[13];		// turn on clock for PIOC			pg. 542
-	// pioa instance 11
-	PMC->PMC_PCER0 = b[11];		// turn on clock for PIOA			pg. 542
-	
-	// pwm instance 36
-	PMC->PMC_PCER1 = b[4];		// turn on clock for PWM			pg. 563
-	
-}
-
-void setup_PIOC6_PWM(){
-	
-	// disable pwm on channel 2
-	PWM->PWM_DIS = b[2];	// 										pg. 1008
-	
-	// *** Setup PIOC Pin to use PWM ***
-	// disable pull up resistor. through PIO_PUDR					pg. 622
-	PIOC->PIO_PUDR = b[6];	// 										pg. 653
-	// disable PIO control of PIOC
-	PIOC->PIO_PDR = b[6];	// 										pg. 634
-	// select peripheral B
-	PIOC->PIO_ABSR |= b[6];	// 										pg. 656
-	
-	// *** setup pwm registers ***
-	
-	// Not using CLKA, CLKB
-	PWM->PWM_CLK = 0;	// 											pg. 1006
-	
-	PWM->PWM_CH_NUM[2].PWM_CMR = 0 		// channel mode				pg. 1044
-		| 0b0011			// use: master_clock / 8
-		//| PWM_CMR_CPOL		// Start LOW at beginning of pulse
-		// i want it to start high, so not using CPOL.
-	;
-	
-	PWM->PWM_CH_NUM[2].PWM_CDTY = 0;	// duty cycle				pg. 1046
-	
-	// pwm comparisons.
-	PWM->PWM_CMP[2].PWM_CMPM = 0;
-	
-	
-	// pwm channel period will be 1000
-	PWM->PWM_CH_NUM[2].PWM_CPRD = 1000;		//						pg. 1048
-	
-	// enable PWM on channel 2
-	PWM->PWM_ENA = b[2];	// 										pg. 1007
-}
-
-void write_PIOC6_PWM_Value(uint16_t val){
-	if (val > 1000) val = 1000;
-	PWM->PWM_CH_NUM[2].PWM_CDTYUPD = val;
-}
-
-
-
-void setup_PIOA19_PWM(){
-	// disable pwm on channel 1
-	PWM->PWM_DIS = b[1];	// 										pg. 1008
-
-	// *** Setup PIOA Pin to use PWM ***
-	// disable pull up resistor. through PIO_PUDR					pg. 622
-	PIOA->PIO_PUDR = b[19];	// 										pg. 653
-	// disable PIO control of PIOA
-	PIOA->PIO_PDR = b[19];	// 										pg. 634
-	// select peripheral B
-	PIOA->PIO_ABSR |= b[19];	// 									pg. 40, 656
-	
-	// *** setup pwm registers ***
-	
-	// Not using CLKA, CLKB
-	//PWM->PWM_CLK = 0;	// 											pg. 1006
-	
-	PWM->PWM_CH_NUM[1].PWM_CMR = 0 		// channel mode				pg. 1044
-		| 0b0011			// use: master_clock / 8
-		| PWM_CMR_CPOL		// Start HIGH at beginning of pulse
-		// i want it to start HIGH so using CPOL
-	;
-	
-	PWM->PWM_CH_NUM[1].PWM_CDTY = 0;	// duty cycle				pg. 1046
-	
-	// pwm comparisons.
-	PWM->PWM_CMP[1].PWM_CMPM = 0;
-	
-	
-	// pwm channel period will be 1000
-	PWM->PWM_CH_NUM[1].PWM_CPRD = 1000;		//						pg. 1048
-	
-	// enable PWM on channel 1
-	PWM->PWM_ENA = b[1];	// 										pg. 1007
-	
-}
-
-void write_PIOA19_PWM_Value(uint16_t val){
-	if (val > 1000) val = 1000;
-	PWM->PWM_CH_NUM[1].PWM_CDTYUPD = val;
-}
-
-
-
-
 
 
 
