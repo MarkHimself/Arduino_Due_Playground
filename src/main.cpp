@@ -28,6 +28,9 @@
 	- Updating PWM
 */
 
+char myString[] = "send me over\n";
+uint8_t loc = 0;
+
 void setup() {
 	
 	
@@ -39,20 +42,25 @@ void setup() {
 	
 	reset_Timer_Controller();
 	setup_timer_for_ms_delay();
+	setup_UART_empty_tx_int();
 	
 }
 
 void loop() {
-	// transmitting numbers and letters through uart to com port.
-	for (uint8_t i = 48; i < 127; i++){
-		transmit_UART(i);
-		delay_ms(10);
-		transmit_UART(10);		// transmit new line.
-		delay_ms(100);
+	
+	for (int i = 50; i < 60; i++){
+		delay_ms(1000);
+		myString[0] = i;
 	}
-	delay(3000);
 }
 
+void UART_Handler(){
+	uint32_t uart_int_status = UART->UART_SR;		// Read status Register		pg. 764
+	if (uart_int_status & UART_SR_TXEMPTY){
+		transmit_UART(myString[loc]);
+		loc = (loc+1) % sizeof(myString);
+	}
+}
 
 
 

@@ -43,6 +43,11 @@ void setup_PIOA9_as_UART_TX(){
 	PIOA->PIO_ABSR = PIOA->PIO_ABSR & (~PIO_ABSR_P9);	// select peripheral A	pg. 622, 
 }
 
+void setup_UART_empty_tx_int(){
+	UART->UART_IER = UART_IER_TXEMPTY;
+	NVIC_EnableIRQ(UART_IRQn);			// nvic functions						pg. 164
+	NVIC_SetPriority(UART_IRQn, 4);
+}
 
 
 

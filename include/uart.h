@@ -17,6 +17,7 @@ UART supports only 8 bit (with parity)
 
 void setup_UART();
 bool transmit_UART(uint8_t val);
+void setup_UART_empty_tx_int();
 // add code to change baud rate.
 
 void setup_PIOA8_as_UART_RX();
