@@ -42,7 +42,6 @@ check that clock is disabled before entering oneshot (if enabled, then oneshot i
 		- component_tc.h
 	- Don't forget to read the status register inside the interrupt or else system freezes.
 	- Most logic is untested. the interrupt does work though!
-		
 */
 
 
