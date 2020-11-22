@@ -167,11 +167,13 @@ void TC2_1_disable_interrupts(){
 	TC2->TC_CHANNEL[1].TC_IDR = TC_IDR_CPCS;		// disable interrupt on RC Compare. pg. 896
 }
 
+/*
 void TC7_Handler(){
 	uint32_t TC2_1_int_status = TC2->TC_CHANNEL[1].TC_SR;		// read status to allow for more interrupts.
 	//NVIC_ClearPendingIRQ(TC7_IRQn);
 	TC2_1_int_flag = true;
 }
+*/
 
 bool get_TC2_1_int_flag(){
 	bool pre_flag = TC2_1_int_flag;
