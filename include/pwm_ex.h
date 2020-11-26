@@ -21,8 +21,9 @@ void setup_pwm_ch_2_int();
 void enable_pwm_ch_2_int();
 void disable_pwm_ch_2_int();
 
-
-
+void setup_pwmSyncPDC_ch_0_PIOC3();
+void setup_PDC_for_pwm_ch_0();
+void start_pwmSyncPDC_ch_0_PIOC3(uint16_t *buf, uint8_t length);
 
 
 
