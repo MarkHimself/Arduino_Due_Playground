@@ -111,6 +111,7 @@ void setup_pwmSyncPDC_ch_0_PIOC3(){
 	;
 	
 	PWM->PWM_CH_NUM[0].PWM_CDTY = 0;	// duty cycle				pg. 1046
+	//PWM->PWM_CH_NUM[0].PWM_CDTY = 100;	// duty cycle				pg. 1046
 	
 	// pwm comparisons.
 	PWM->PWM_CMP[0].PWM_CMPM = 0;
@@ -121,9 +122,11 @@ void setup_pwmSyncPDC_ch_0_PIOC3(){
 	PWM->PWM_SCM = 0			// synchronous channels register	pg. 1014
 		| PWM_SCM_SYNC0			// ch. 0 is a synchronous channel
 		| PWM_SCM_UPDM_MODE2	// use PDC to update values.
+		//| (0x03 << 16)			// reserved value. lets just see what happens...
 	;
 	
-	PWM->PWM_SCUP = PWM_SCUP_UPR(0);	// update PWM duty cycle every time.	pg. 1017
+	//PWM->PWM_SCUP = PWM_SCUP_UPR(0);	// update PWM duty cycle every time.	pg. 1017
+	PWM->PWM_SCUP = PWM_SCUP_UPR(3);	// update PWM duty cycle every 10 cycles.	pg. 1017
 	//PWM->PWM_IER2 = PWM_IER2_ENDTX;		// pdc transfer done int enable.		pg. 1019
 	
 	// enable PWM on channel 0
@@ -151,7 +154,117 @@ void start_pwmSyncPDC_ch_0_PIOC3(uint16_t *buf, uint8_t length){
 	PWM->PWM_PTCR = PWM_PTCR_TXTEN;	// Transmitter Transfer Enable				pg. 517
 }
 
+// *** AHB DMA for PWM *** //
 
+uint8_t ahb_pwm_ch_num = 0;
+bool setup_AHB_DMA_for_pwm(){
+	uint32_t temp_var = 0;
+	
+	// setup clock for AHB DMA.
+	PMC->PMC_PCER1 = PMC_PCER1_PID39;
+	DMAC->DMAC_WPMR = 0x444D41 << 8;	// unlock write protect					pg. 380
+	//DMAC->DMAC_EN = 0;					// disable DMA Controller				pg. 360
+	DMAC->DMAC_EN = DMAC_EN_ENABLE;			// enable DMA Controller			pg. 360
+	temp_var = DMAC->DMAC_EBCISR;		// read status of dma to clear int's.	pg. 367
+	
+	temp_var = DMAC->DMAC_CHSR;			// Channel handler status register		pg. 370
+	// find a disabled channel.
+	for (uint8_t i = 0, en_mask = 1; i < 6; i++, en_mask = en_mask << 1){
+		if (temp_var & en_mask){
+			if (i == 5) return false;		// couldn't find a disabled channel
+		}
+		else{
+			ahb_pwm_ch_num = i;
+			break;
+		}
+	}
+	//DMAC->DMAC_GCFG = DMAC_GCFG_ARB_CFG_ROUND_ROBIN;	// round robit priority	pg. 359
+	DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_DSCR = 0;	//						pg. 373
+	return true;
+}
 
+void start_AHB_DMA_for_pwm(uint16_t *source, uint16_t length){
+	
+	DMAC->DMAC_CHDR = (1 << ahb_pwm_ch_num);		// Disable the channel		pg. 369
+	while(DMAC->DMAC_CHSR & (1 << ahb_pwm_ch_num)){	// wait while its enabled 	pg. 370
+		
+	}
+	uint32_t temp_var = 0;
+	temp_var = DMAC->DMAC_EBCISR;		// read status of dma to clear int's.	pg. 367
+	
+	DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_SADDR = (uint32_t)source;		// buffer source address	pg. 371
+	//DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_DADDR = (uint32_t)&REG_PWM_DMAR;	// destination is PWM_DMAR.	pg. 372, S70: pg. 1204, 1239
+	DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_DADDR = (uint32_t)&(PWM->Reserved1[0]);	// destination is PWM_DMAR.	pg. 372, S70: pg. 1204, 1239
+	//DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_DADDR = (uint32_t)&PWM->PWM_CH_NUM[0].PWM_CDTYUPD;	// 		pg. 1047
+	DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_DSCR = 0;	//						pg. 373
+	DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_CTRLA = 0	// Control A reg.		pg. 374
+		| DMAC_CTRLA_BTSIZE(length)	// buffer transfer size
+		| DMAC_CTRLA_SCSIZE_CHK_1	// ???
+		| DMAC_CTRLA_DCSIZE_CHK_1	// ???
+		//| DMAC_CTRLA_SCSIZE_CHK_8	// ???
+		//| DMAC_CTRLA_DCSIZE_CHK_8	// ???
+		//| DMAC_CTRLA_SCSIZE_CHK_256	// ???
+		//| DMAC_CTRLA_DCSIZE_CHK_256	// ???
+		| DMAC_CTRLA_SRC_WIDTH_HALF_WORD	// 16 bit source
+		//| DMAC_CTRLA_DST_WIDTH_HALF_WORD	// 16 bit destination
+		| DMAC_CTRLA_DST_WIDTH_WORD	// 32 bit destination
+	;
+	DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_CTRLB = 0	// Control B reg.		pg. 376
+		//| DMAC_CTRLB_SRC_DSCR_FETCH_FROM_MEM			// fetch source descriptor - it's zero anyways.
+		//| DMAC_CTRLB_DST_DSCR_FETCH_FROM_MEM			// fetch destinaiton descriptor - it's zero anyways.
+		| DMAC_CTRLB_SRC_DSCR_FETCH_DISABLE				// fetch source descriptor disable
+		| DMAC_CTRLB_DST_DSCR_FETCH_DISABLE				// fetch destination descriptor disable
+		| DMAC_CTRLB_FC_MEM2PER_DMA_FC					// memory to peripheral
+		| DMAC_CTRLB_SRC_INCR_INCREMENTING				// increment source address during transfer
+		| DMAC_CTRLB_DST_INCR_FIXED						// destination address unchanged.
+	;
+	
+	/*
+	Notes for memory to peripheral transfer.
+	Table 22-2 on pg. 339
+	PWM Transmit 15: 	transmit to the PWM peripheral. interface number 15
+	ex: SPI0 Receive 2: 	receive from SPI0. interface number 2
+	DST_PER: Connect it to the transmit interface number.
+	Use destination hardware handshaking.
+	*/
+	DMAC->DMAC_CH_NUM[ahb_pwm_ch_num].DMAC_CFG = 0		// configuration register	pg. 378
+		| DMAC_CFG_DST_PER(15)							// destination peripheral is PWM
+		//| DMAC_CFG_SRC_PER(15)							// source peripheral is PWM
+		| DMAC_CFG_SRC_H2SEL_SW							// source software handshaking ???		// not much info on what to choose
+		//| DMAC_CFG_SRC_H2SEL_HW							// source hardware handshaking ???		// not much info on what to choose
+		//| DMAC_CFG_DST_H2SEL_SW							// destination software handshaking ???	// for memory to peripheral xfer
+		| DMAC_CFG_DST_H2SEL_HW							// destination hardware handshaking ???	// for memory to peripheral xfer
+		| DMAC_CFG_SOD									// disable dma when done.		???
+		| DMAC_CFG_FIFOCFG_ASAP_CFG						// ???
+		//| DMAC_CFG_AHB_PROT(2)							// ??? 
+	;
+	
+	//PWM->PWM_SCUC = PWM_SCUC_UPDULOCK;	// update unlock						pg. 1016
+	DMAC->DMAC_EN = DMAC_EN_ENABLE;						// enable DMAC							pg. 360
+	delay(1);
+	DMAC->DMAC_LAST = 0x2 << (ahb_pwm_ch_num * 2);		// last transfer.		pg. 363
+	DMAC->DMAC_CHER = (1 << ahb_pwm_ch_num);	// enable the channel			pg. 368
+	//DMAC->DMAC_SREQ = 0x03 << (ahb_pwm_ch_num * 2);		// destination/source transfer request	pg. 361
+	//DMAC->DMAC_SREQ = 0x01 << (ahb_pwm_ch_num * 2);		// destination transfer request			pg. 361
+	//DMAC->DMAC_SREQ = 0x02 << (ahb_pwm_ch_num * 2);		// source transfer request				pg. 361
+	//DMAC->DMAC_CREQ = 0x03 << (ahb_pwm_ch_num * 2);		// destination/source chunk transfer request	pg. 362
+	DMAC->DMAC_CREQ = 0x02 << (ahb_pwm_ch_num * 2);			// destination chunk transfer request	pg. 362
+	//DMAC->DMAC_CREQ = 0x01 << (ahb_pwm_ch_num * 2);			// source chunk transfer request	pg. 362
+	//PWM->PWM_ENA = PWM_ENA_CHID0;	// 								pg. 1007
+	
+	while (DMAC->DMAC_CHSR & (1 << ahb_pwm_ch_num)){			// while ch. is enabled	pg. 370
+		// wait for DMA to finish.
+		Serial.println("A");
+		Serial.println(PWM->PWM_ISR2, HEX);
+		Serial.println(DMAC->DMAC_CHSR, HEX);
+		Serial.println(DMAC->DMAC_EBCIMR, HEX);
+		Serial.println(DMAC->DMAC_EBCISR, HEX);
+		Serial.println("Z");
+		Serial.println(PWM->PWM_SCUP >> 4);
+		//DMAC->DMAC_CHDR = (1 << ahb_pwm_ch_num);		// Disable the channel		pg. 369
+		//break;
+	}
+	
+}
 
 
