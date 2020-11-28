@@ -31,4 +31,18 @@ void setup_PIOA8_as_UART_RX();
 void setup_PIOA9_as_UART_TX();
 
 
+// *** USART0 *** //
+
+void setup_USART0(uint32_t baud_rate);
+void setup_PIOA11_as_USART0_TX();
+bool write_USART0_TX(uint8_t val);
+
+void setup_USART0_TX_String_AHB_DMA();
+void start_USART0_TX_String_AHB_DMA(char *str, uint8_t str_length);
+
+
+
+
+
+
 #endif
