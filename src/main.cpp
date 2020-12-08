@@ -11,11 +11,18 @@ void set_PIOD10_Output();
 void set_PIOD10_State(bool ishigh);
 
 /*
-setting up SPI - and different methods of controlling it
-	- blocking spi transfers
-	- non-blocking spi transfers
-	- interrupt controlled spi transfers (current example is very simple and only for reading a single register on another device)
+setting up SPI - interrupt transfer
+	- provide a buffer of data to transfer
+	- provide a buffer that records all received data
+	- setting the transaction length to zero and requesting a transaction
+		- this dangerous scenario hasn't been tested but is expected to work. safety logic added into ISR.
+	- future immprovements:
+		- change the ISR to use a pointer instead.
+			- multiple SPI_INT_DATA variables can be declared and their address can be assigned to the one to be transferred.
+			- for multiple SPI_INT_DATA variables, the transactionInProgress variable may need to be static.?
 */
+
+SPI_INT_DATA<25> spi_int_data_ex;		// create a int data structure capable of transferring up to 5 bytes through spi.
 
 void setup() {
 	
@@ -40,64 +47,56 @@ void setup() {
 	NVIC_EnableIRQ(SPI0_IRQn);		// enable spi0 interrupts					pg. 164
 	NVIC_SetPriority(SPI0_IRQn, 0);		// set a pretty important priority but not most important.
 	
+	// prepare the spi transaction that should take place through interrupts.
+	//spi_int_data_ex.toTransfer[0] = 117 | 0x80;	// read the who am i register of MPU9250
+	spi_int_data_ex.toTransfer[0] = 85 | 0x80;
+	for (int i = 1; i < 25; i++) spi_int_data_ex.toTransfer[i] = 0;
+	spi_int_data_ex.setTransLength(10);
+	
 }
 
-// only used for spi interrupt example			(this can be cleaned up in a struct/class)
-uint8_t toTransfer[2] = {117 | 0x80, 0};
-uint8_t received = 0;
-uint8_t loc = 0;
-uint8_t transLength = 2;
-uint8_t last_read_value = 0;		// the isr will only return the last read value.
-// if you made the transfer array longer, you would only have the last value read.
-// a better implementation would be to have an array of read values.
-// this will allow multiple bytes to be read and stored. (probably future example)
-
-bool transactionFinished = false;
-bool startNewTransaction = true;
+bool do_once = true;
 
 void loop() {
 	
-	uint8_t temp = 0;
-	
-	/*
-	// spi using a blocking transaction.
-	set_PIOD10_State(false);			// read the who am i register of MPU9250
-	write_SPI0_blocking(117 | 0x80);	// send the address with a read request
-	temp = write_SPI0_blocking(0x00);	// read the value.
-	set_PIOD10_State(true);
-	Serial.println(temp);
-	delay_ms(100);
-	*/
-	
-	/*
-	// spi using a non-blocking transaction
-	set_PIOD10_State(false);
-	write_SPI0_nonblocking(117 | 0x80);
-	while(!is_SPI0_Transmit_Available());	// useful stuff can be done while waiting for transaction to finish.
-	write_SPI0_nonblocking(0x00);
-	while(!is_SPI0_Transmit_Available());	// wait for second transaction to finish.
-	set_PIOD10_State(true);
-	//while (!is_SPI0_Data_Available());		// ensure there is data. obviously there is (since we waited for transaction to finish).
-	temp = read_SPI0_nonblocking();
-	Serial.println(temp);
-	delay_ms(100);
-	*/
-	
-	
-	// only used for spi interrupt example
-	if (!transactionFinished & startNewTransaction) {
-		startNewTransaction = false;
-		delay_ms(100);
-		SPI0_Enable_Int_TXEMPTY();
-		//write_SPI0_nonblocking(0x00);
+	// triggering the transaction software.
+	if (!spi_int_data_ex.isTransactionInProgress() /* && some user personal code */ & do_once){
+		spi_int_data_ex.setNewTransactionRequest();
+		do_once = false;
 	}
 	
-	if (transactionFinished){
-		transactionFinished = false;
+	// triggering the hardware to perform the transaction.
+	if (!spi_int_data_ex.isTransactionInProgress() & spi_int_data_ex.isStartNewTransactionRequest()){	// if a transaction has been requested
+		spi_int_data_ex.resetNewTransactionRequest();	// reset the request since we are servicing it.
+		SPI0_Enable_Int_TXEMPTY();
+	}
+	
+	// transaction over.
+	if (spi_int_data_ex.isTransactionFinished()){
+		spi_int_data_ex.resetTransactionInProgress();
+		spi_int_data_ex.resetTransactionFinished();
 		SPI0_Disable_Int_RDRF();
-		Serial.println(last_read_value);
+		
+		// rest of code is user dependent.
+		// print the values.
+		for (int i = 0; i < spi_int_data_ex.getTransLength(); i++) {
+			Serial.print(spi_int_data_ex.received[i]);
+			if (i != (spi_int_data_ex.getTransLength() - 1)) Serial.print("\t");	// why wait like an extra 260us??
+		}
+		Serial.print("\n");
+		
 		delay_ms(100);
-		startNewTransaction = true;
+		spi_int_data_ex.setNewTransactionRequest();		// perform another request - this can be requested here or in another part of the code.
+		// (if you don't need to start a new transaction immediately when the previous one finished).
+		
+		// scan the mpu9250 10 bytes at a time while incrementing the starting location by 1 each time.
+		// yeah for fun. would look better if i actually powered and set up the gyro/accel/mag in here also.
+		if ((spi_int_data_ex.toTransfer[0] & 127) < 110){
+			spi_int_data_ex.toTransfer[0] = ((spi_int_data_ex.toTransfer[0] & 0x7F) + 1) | 0x80;
+		}
+		else{
+			spi_int_data_ex.toTransfer[0] = 0x80;
+		}
 	}
 	
 }
@@ -135,25 +134,38 @@ void SPI0_Handler(){
 	// reading the status register is pointless actually.
 	// reading only the status register will not work!
 	if ((status & SPI_SR_TXEMPTY) & (SPI0->SPI_IMR & SPI_IMR_TXEMPTY)){	// 		pg. 698, 702
-		if (loc == 0){						// if starting a new transaction
-			set_PIOD10_State(false);		// set the chip select LOW
+		if (spi_int_data_ex.getLocation() == 0){						// if starting a new transaction
+			set_PIOD10_State(false);									// set the chip select LOW
 		}
-		write_SPI0_nonblocking(toTransfer[loc]);	// write the first byte
-		loc++;										// increment the location of the buffer
-		if (loc == transLength){					// if at end of buffer
-			SPI0_Disable_Int_TXEMPTY();				// disable the empty interrupt (since we aren't sending anything else)
-			SPI0_Enable_Int_RDRF();					// enable the receive data register full - so we can read the last value
-			//loc = 0;	// it's reset in the read part of the ISR.
+		if (spi_int_data_ex.getLocation() != 0){
+			spi_int_data_ex.received[spi_int_data_ex.getLocation() - 1] = read_SPI0_nonblocking();	// read the value that was received when the previous byte was sent.
+		}
+		
+		// probably better to put this in the beginning and nest everything inside it.
+		if (spi_int_data_ex.getTransLength() > 0){								// ensure transaction has bytes to transfer.
+			write_SPI0_nonblocking(spi_int_data_ex.toTransfer[spi_int_data_ex.getLocation()]);	// write the first byte
+		}
+		else{
+			spi_int_data_ex.setTransactionFinished();							// the transaction is over
+			set_PIOD10_State(true);												// set chip select HIGH
+			spi_int_data_ex.resetLocation();									// reset the buffer pointer to 0
+			SPI0_Disable_Int_TXEMPTY();											// disable the empty interrupt (since we aren't sending anything else)
+			return;
+		}
+		
+		spi_int_data_ex.incrementLocation();				// increment the location of the buffer
+		if (spi_int_data_ex.isEndOfTransfer()){				// if at end of buffer
+			SPI0_Disable_Int_TXEMPTY();						// disable the empty interrupt (since we aren't sending anything else)
+			SPI0_Enable_Int_RDRF();							// enable the receive data register full - so we can read the last value
 		}
 	}
 	else if ((status & SPI_SR_RDRF) & (SPI0->SPI_IMR & SPI_IMR_RDRF)){	// last value is ready to be read
-		transactionFinished = true;					// the transaction is over
-		set_PIOD10_State(true);						// set chip select HIGH
-		last_read_value = read_SPI0_nonblocking();	// read the last value
-		loc = 0;									// reset the buffer pointer to 0
+		spi_int_data_ex.setTransactionFinished();							// the transaction is over
+		set_PIOD10_State(true);												// set chip select HIGH
+		spi_int_data_ex.received[spi_int_data_ex.getLocation() - 1] = read_SPI0_nonblocking();		// read the last value
+		spi_int_data_ex.resetLocation();									// reset the buffer pointer to 0
 	}
 }
-
 
 
 
