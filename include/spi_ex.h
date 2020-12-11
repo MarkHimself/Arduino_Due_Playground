@@ -149,5 +149,15 @@ void SPI_INT_DATA<S>::setTransLength(uint8_t length){
 	if (!transactionInProgress) transLength = length;
 }
 
+void setup_SPI0_Tx_DMA();
+void setup_SPI0_Rx_DMA();
+void start_SPI0_DMA(uint8_t *tx, uint8_t *rx, uint8_t count);
+
+
+
+
+
+
+
 
 #endif

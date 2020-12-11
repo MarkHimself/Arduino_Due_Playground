@@ -2,27 +2,30 @@
 #include <cstdint>
 
 #include "timer_counter.h"
-#include "uart.h"
-#include "ahb_dma_mem.h"
+#include "dma_controller.h"
 #include "spi_ex.h"
+
 
 void enable_PIOD();
 void set_PIOD10_Output();
 void set_PIOD10_State(bool ishigh);
 
 /*
-setting up SPI - interrupt transfer
-	- provide a buffer of data to transfer
-	- provide a buffer that records all received data
-	- setting the transaction length to zero and requesting a transaction
-		- this dangerous scenario hasn't been tested but is expected to work. safety logic added into ISR.
-	- future immprovements:
-		- change the ISR to use a pointer instead.
-			- multiple SPI_INT_DATA variables can be declared and their address can be assigned to the one to be transferred.
-			- for multiple SPI_INT_DATA variables, the transactionInProgress variable may need to be static.?
+setting up SPI - AHB DMA transfer
+	- using the same class from the SPI Interrupt example
+		- better to make a new data structure. even a simple struct would do
+	- DMA write only operation:
+		- give the DMA the buffer address and the length of the buffer.
+		- give the DMA a NULL for the receiving buffer address
+		- an interrupt notifies when the write is finished.
+	- DMA write/read operation:
+		- give the DMA the buffer address and the length of the buffer.
+		- give the DMA a buffer for storing received data
+		- an interrupt notifies when the write is finished.
 */
 
-SPI_INT_DATA<25> spi_int_data_ex;		// create a int data structure capable of transferring up to 5 bytes through spi.
+// for SPI DMA, something simpler is needed... didn't feel like changing it though... so still using the interrupt data structure.
+SPI_INT_DATA<7> spi_int_data_ex;		// create an spi interrupt data structure capable of transferring up to 7 bytes through spi.
 
 void setup() {
 	
@@ -35,6 +38,7 @@ void setup() {
 	set_PIOD10_Output();
 	set_PIOD10_State(true);
 	
+	// set up SPI0
 	setup_SPI0_Master(3);		// set up spi in mode 3
 	SPI0_Disable_Int_RDRF();
 	SPI0_Disable_Int_TXEMPTY();
@@ -43,62 +47,56 @@ void setup() {
 	setup_PIOA27_as_SPI0_SCK();
 	SPI0_Clock_Rate_khz(1000);	// use 1000KHz (1MHz)
 	
-	// only used for spi interrupt example
+	delay_ms(4);
+	
+	// only used for spi interrupt example (it is possible to transmit through DMA and receive through SPI interrupts)
 	NVIC_EnableIRQ(SPI0_IRQn);		// enable spi0 interrupts					pg. 164
-	NVIC_SetPriority(SPI0_IRQn, 0);		// set a pretty important priority but not most important.
+	NVIC_SetPriority(SPI0_IRQn, 0);		// set the most important priority
+	
+	NVIC_EnableIRQ(DMAC_IRQn);		// enable DMAC interrupts.
+	NVIC_SetPriority(DMAC_IRQn, 2);
+	
+	DMA_power_on();				// power on the DMA.
+	DMA_AHB_Unlock_Write_Protect();
 	
 	// prepare the spi transaction that should take place through interrupts.
-	//spi_int_data_ex.toTransfer[0] = 117 | 0x80;	// read the who am i register of MPU9250
-	spi_int_data_ex.toTransfer[0] = 85 | 0x80;
-	for (int i = 1; i < 25; i++) spi_int_data_ex.toTransfer[i] = 0;
-	spi_int_data_ex.setTransLength(10);
+	spi_int_data_ex.toTransfer[0] = 117 | 0x80;	// read the who am i register of MPU9250
+	for (int i = 1; i < 7; i++) spi_int_data_ex.toTransfer[i] = 0;
+	spi_int_data_ex.setTransLength(7);
+	// 0	115	0	21	34	0	18		// <---- Output i got using the interrupt code. DMA should (and is) the same.
+	
+	setup_SPI0_Tx_DMA();
+	setup_SPI0_Rx_DMA();
+	
+	/*
+	// using dma to transfer transmit buffer and ISR to read the received values..
+	SPI0_Enable_Int_RDRF();	
+	set_PIOD10_State(false);									// set the chip select LOW
+	start_SPI0_DMA(spi_int_data_ex.toTransfer, NULL, spi_int_data_ex.getTransLength());
+	*/
+	
+	// using dma to transfer transmit buffer and dma to read the received values
+	set_PIOD10_State(false);									// set the chip select LOW
+	start_SPI0_DMA(spi_int_data_ex.toTransfer, spi_int_data_ex.received, spi_int_data_ex.getTransLength());
 	
 }
 
-bool do_once = true;
-
 void loop() {
 	
-	// triggering the transaction software.
-	if (!spi_int_data_ex.isTransactionInProgress() /* && some user personal code */ & do_once){
-		spi_int_data_ex.setNewTransactionRequest();
-		do_once = false;
-	}
+	delay_ms(5);
 	
-	// triggering the hardware to perform the transaction.
-	if (!spi_int_data_ex.isTransactionInProgress() & spi_int_data_ex.isStartNewTransactionRequest()){	// if a transaction has been requested
-		spi_int_data_ex.resetNewTransactionRequest();	// reset the request since we are servicing it.
-		SPI0_Enable_Int_TXEMPTY();
-	}
-	
-	// transaction over.
 	if (spi_int_data_ex.isTransactionFinished()){
-		spi_int_data_ex.resetTransactionInProgress();
-		spi_int_data_ex.resetTransactionFinished();
-		SPI0_Disable_Int_RDRF();
 		
-		// rest of code is user dependent.
-		// print the values.
 		for (int i = 0; i < spi_int_data_ex.getTransLength(); i++) {
 			Serial.print(spi_int_data_ex.received[i]);
 			if (i != (spi_int_data_ex.getTransLength() - 1)) Serial.print("\t");	// why wait like an extra 260us??
 		}
 		Serial.print("\n");
-		
-		delay_ms(100);
-		spi_int_data_ex.setNewTransactionRequest();		// perform another request - this can be requested here or in another part of the code.
-		// (if you don't need to start a new transaction immediately when the previous one finished).
-		
-		// scan the mpu9250 10 bytes at a time while incrementing the starting location by 1 each time.
-		// yeah for fun. would look better if i actually powered and set up the gyro/accel/mag in here also.
-		if ((spi_int_data_ex.toTransfer[0] & 127) < 110){
-			spi_int_data_ex.toTransfer[0] = ((spi_int_data_ex.toTransfer[0] & 0x7F) + 1) | 0x80;
-		}
-		else{
-			spi_int_data_ex.toTransfer[0] = 0x80;
-		}
+		delay_ms(10);
+		spi_int_data_ex.resetTransactionFinished();
+		set_PIOD10_State(false);									// set the chip select LOW to select the MPU9250
+		start_SPI0_DMA(spi_int_data_ex.toTransfer, spi_int_data_ex.received, spi_int_data_ex.getTransLength());
 	}
-	
 }
 
 void enable_PIOD(){
@@ -160,12 +158,43 @@ void SPI0_Handler(){
 		}
 	}
 	else if ((status & SPI_SR_RDRF) & (SPI0->SPI_IMR & SPI_IMR_RDRF)){	// last value is ready to be read
+		
+		// send through dma and read on interrupts
+		if (spi_int_data_ex.getLocation() == spi_int_data_ex.getTransLength()){
+			spi_int_data_ex.setTransactionFinished();							// the transaction is over
+			set_PIOD10_State(true);												// set chip select HIGH
+			
+		}
+		spi_int_data_ex.received[spi_int_data_ex.getLocation()] = read_SPI0_nonblocking();		// read the last value
+		spi_int_data_ex.incrementLocation();				// increment the location of the buffer
+		
+		
+		// code that was used solely for the spi interrupt example.
+		/*
 		spi_int_data_ex.setTransactionFinished();							// the transaction is over
 		set_PIOD10_State(true);												// set chip select HIGH
 		spi_int_data_ex.received[spi_int_data_ex.getLocation() - 1] = read_SPI0_nonblocking();		// read the last value
 		spi_int_data_ex.resetLocation();									// reset the buffer pointer to 0
+		*/
 	}
 }
+
+void DMAC_Handler(){
+	uint32_t dma_status = DMAC->DMAC_CHSR;			// channel					pg. 370
+	uint32_t dma_ebcimr_mask = DMAC->DMAC_EBCIMR;	// mask reg.				pg. 366
+	uint32_t dma_ebcisr_status = DMAC->DMAC_EBCISR;	// status reg.				pg. 367
+	
+	if (dma_ebcisr_status & (DMAC_EBCISR_BTC4 | DMAC_EBCISR_BTC5)){				// pg. 367
+		spi_int_data_ex.setTransactionFinished();
+		DMAC->DMAC_EBCIDR = 0	// Disable int reg.								pg. 365
+			| DMAC_EBCIDR_BTC4
+			| DMAC_EBCIDR_BTC5
+		;
+		set_PIOD10_State(true);		// set chip select HIGH - ends communication with MPU9250
+	}
+	
+}
+
 
 
 
