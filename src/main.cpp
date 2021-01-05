@@ -11,7 +11,8 @@
 /*
 setting up I2C
 	- Currently have the most basic i2c functions
-	- I2C hangs are currently NOT addressed. (I2C bus is not freed from an I2C bus hang)
+	- I2C hangs are successfully detected (at least i think so)
+	- I2C hang recovery is not yet implemented.
 
 to do:
 	- implement the most robust possible i2c bus hang detection system.
@@ -26,19 +27,41 @@ void setup() {
 	reset_Timer_Controller();
 	setup_timer_for_ms_delay();
 	
-	Serial.begin(38400);
+	Serial.begin(115200);
 	
 	setup_I2C0_master();
 	setup_PIOA18_as_TWI0_TWCK0();
 	setup_PIOA17_as_TWI0_TWD0();
+	//I2C0_Clock_Rate_100khz();
+	I2C0_Clock_Rate_khz(400);
 	
-	
+	delay_ms(4000);
 }
 
 uint8_t readValue = 0;
 uint8_t readBuf[6];
 
+bool disInt = true;
+
 void loop() {
+	
+	Serial.println("start");
+	
+	// 115	0	19	68	0	29	
+	read_I2C0_blocking(0x68, 0x75, readBuf, 6);
+	
+	for (uint8_t i = 0; i < 6; i++){
+		Serial.print(readBuf[i]);
+		Serial.print("\t");
+		readBuf[i] = 0;
+	}
+	Serial.print("\n");
+	delay_ms(10);
+	
+	if (!I2C0_transactionSucceeded()){
+		Serial.println("failed\n");
+	}
+	
 	
 	
 	/*

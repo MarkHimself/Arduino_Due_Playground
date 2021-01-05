@@ -9,7 +9,6 @@ void reset_Timer_Controller(){
 	TC1->TC_QIDR = 7;					// disabl quad decoder Interrupts		pg. 904
 	TC1->TC_FMR = 0;					// disable faults						pg. 907
 	
-	
 	// TC2 channel 0 is instance number 33
 	TC2->TC_BMR = 0;					// block mode register					pg. 901
 	TC2->TC_QIDR = 7;					// disabl quad decoder Interrupts		pg. 904
@@ -144,12 +143,12 @@ void setup_TC2_1_for_interrupts(){
 	TC2->TC_CHANNEL[1].TC_RC = 10500 * 100;			// interrupt period. 100ms	pg. 891
 }
 
-void TC2_1_interrupt_period(uint16_t fre_ms){
+void TC2_1_interrupt_period(uint16_t fire_ms){
 	// get clock status to determine if interrupts were disabled or not.
 	bool TC2_1_ClockStatus = TC2->TC_CHANNEL[1].TC_SR & TC_SR_CLKSTA;	//		pg. 892
 	
 	TC2->TC_CHANNEL[1].TC_CCR = TC_CCR_CLKDIS;		// disable clock			pg. 880
-	TC2->TC_CHANNEL[1].TC_RC = 10500 * fre_ms;			// interrupt period. 100ms	pg. 891
+	TC2->TC_CHANNEL[1].TC_RC = 10500 * fire_ms;			// interrupt period. 100ms	pg. 891
 	if (TC2_1_ClockStatus){
 		TC2->TC_CHANNEL[1].TC_CCR = TC_CCR_SWTRG | TC_CCR_CLKEN;	//			pg. 880
 	}

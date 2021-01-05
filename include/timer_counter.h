@@ -56,7 +56,7 @@ void oneshot_TIOA6_us(uint16_t pulse_us);
 void oneshot_TIOA6_42MHz_Clock_Ticks(uint16_t pulse_ticks);
 
 void setup_TC2_1_for_interrupts();
-void TC2_1_interrupt_period(uint16_t fre_ms);
+void TC2_1_interrupt_period(uint16_t fire_ms);
 void TC2_1_enable_interrupts();
 void TC2_1_disable_interrupts();
 bool get_TC2_1_int_flag();

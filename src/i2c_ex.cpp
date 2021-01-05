@@ -1,23 +1,24 @@
 #include "i2c_ex.h"
+#define BUS_HANG_DETECTION
 
 // Set up I2C0 and pins
 
-uint32_t hang = 0;
+int i2c0_clock_period_ns = 0;				// keep track of the clock period so that
+bool i2c0_clock_period_ns_known = false;	// calculating it all the time isn't needed
 
-void hang_reset(){
-	hang = 0;
-}
+bool i2c0_transactionInProgress = false;	// true when a transaction takes place (blocking, non-blocking interrupt/DMA)
+volatile bool i2c0_busHanged = false;		// set true if bus hangs (as determined by timer/interrupt)
+bool i2c0_transactionSucceeded = true;		// allows user to verify that transaction succeeded.
+											// if false, user can check bus_hanged and take action as needed.
 
-bool hang_check(uint8_t where){
-	hang++;
-	if (hang > 100000){
-		hang = 0;
-		Serial.print("hanged\t");
-		Serial.println(where);
-		return true;
-	}
-	return false;
-}
+int i2c0_hangType = 0;						// determine the hang type.
+/*
+	0: no bus hang
+	1: SCL = HIGH, SDA = HIGH
+	2: SCL = HIGH, SDA = LOW
+	3: SCL = LOW, SDA = HIGH
+	4: SCL = LOW, SDA = LOW
+*/
 
 void setup_I2C0_master(){
 	
@@ -38,26 +39,152 @@ void setup_I2C0_master(){
 	// MMR gets written in the I2C send/receive functions
 	TWI0->TWI_MMR = 0;				// master mode register - reset it			pg. 738
 	
-	
-	TWI0->TWI_CWGR = 0				// clock waveform generator reg.			pg. 741
-		| TWI_CWGR_CLDIV(100)		// clock low divider
-		| TWI_CWGR_CHDIV(100)		// clock high divider
-		| TWI_CWGR_CKDIV(1)			// clock dividor
-	;
-	
-	// DADR
-	// CKDIV, CHDIV, CLDIV
-	// SVDIS
-	// MSEN
-	
-	
+	// set to 400 KHz
+	I2C0_Clock_Rate_400khz();
+	setup_TC2_2_for_interrupts();	// used for bus hang detection
 }
 
 // still needs to get done.
-bool I2C0_Clock_Rate_khz(uint16_t f){
+void I2C0_Clock_Rate_khz(uint16_t f){
 	
-	return false;
+	// SCL low period: 	( ( CLDIV x (2^CKDIV) ) + 4 ) x T_MCK
+	// SCL high period: ( ( CHDIV x (2^CKDIV) ) + 4 ) x T_MCK
+	// T_MCK is the period of the master clock. Since the frequency is 84MHz, T_MCK = 1 / ( 84 * 10^(6) ) s = 11.9 ns
+	// T_MCK = 11.9 ns 
+	
+	// ex: CLDIV=100, CHDIV=100, CKDIV=1
+	// low period = high period = ( ( 100 x (2^1) ) + 4 ) x 11.9 ns
+	// low period = high period = ( ( 200 ) + 4 ) x 11.9 ns
+	// low period = high period = 204 x 11.9 ns = 2427.6 ns
+	// low period = high period = 2.4276 us
+	// pretty much what is seen with a logic analyzer.
+	// (i actually see either 2.4, 2.6 or 2.8 us for the low/high clock values (all intermixed every time. interesting))
+	// Calculating the clock frequency f:
+	// T_c: Combine low & high clock periods: 2 * 2.4276 us = 4.8552 us = 4.8552 * 10^(-6) s
+	// f = 1 / (T_c) = 205964.7 Hz = 206 KHz
+	
+	// calculating the CLDIV, CHDIV, CKDIV from provided frequency:
+	// Assumption: low and high clock periods are the same.
+	// Remeber: CLDIV & CHDIV are 8-bits long, CKDIV is 3-bits long
+	// 1. T_c = 1/f					Calculate the period of clock cycle
+	// 2. T_h = T_l = T_c / 2		The low and high periods are half of the clock period
+	// 3. Temp1 = T_h / T_MCK - 4
+	// 4. temp1 = CLDIV * 2^CKDIV	solve for CLDIV by iterating through all the possible CKDIV value.
+	//								the smallest CKDIV values seem to be the most accurate.
+	//								choose the smallest CKDIV value while CLDIV fits into an 8-bit number.
+	//								ensure that combination is possible... 1khz is impossible to produce with 84MHz clock.
+	
+	float f_GHz = f / 1000000.0;
+	float T_l_ns = (1.0 / f_GHz) / 2.0;
+	float temp1 = (T_l_ns / 11.905) - 4.0;
+	
+	float cldiv_fl = 0;
+	int cldiv_int = 0;
+	int ckdiv = 0;
+	bool found_combo = false;					// found a combo to set clock speed.
+	
+	for (uint8_t i = 0; i < 8; ++i){			// i = CKDIV
+		cldiv_fl = temp1 / (float)(1 << i);		//2^CKDIV = 1 << i;
+		
+		// rounding the number seems to give better results...
+		if ((cldiv_fl - (int) cldiv_fl) > 0.5){	// worst way to round a number...
+			cldiv_fl = ((int) cldiv_fl) + 1;
+		}
+		else{
+			cldiv_fl = (int) cldiv_fl;
+		}
+		
+		if (cldiv_fl < 1){
+			cldiv_int = 1;
+			ckdiv = i;
+			found_combo = true;
+			break;
+		}
+		else if (cldiv_fl < 256){
+			cldiv_int = cldiv_fl;
+			ckdiv = i;
+			found_combo = true;
+			break;
+		}
+		
+		if (i == 7 && cldiv_fl > 255){		// super low clock speed.
+			cldiv_int = 255;
+			ckdiv = i;
+			found_combo = true;
+			break;
+		}
+	}
+	
+	if (found_combo){
+		TWI0->TWI_CWGR = 0				// clock waveform generator reg.			pg. 741
+			| TWI_CWGR_CLDIV(cldiv_int)		// clock low divider
+			| TWI_CWGR_CHDIV(cldiv_int)		// clock high divider
+			| TWI_CWGR_CKDIV(ckdiv)			// clock dividor
+		;
+	}
+	else{								// if couldn't find a valid combo, set to 400 khz
+		I2C0_Clock_Rate_400khz();
+	}
+	
+	i2c0_clock_period_ns_known = false;
 }
+
+void I2C0_Clock_Rate_400khz(){
+	TWI0->TWI_CWGR = 0				// clock waveform generator reg.			pg. 741
+		| TWI_CWGR_CLDIV(101)		// clock low divider
+		| TWI_CWGR_CHDIV(101)		// clock high divider
+		| TWI_CWGR_CKDIV(0)			// clock dividor
+	;
+	i2c0_clock_period_ns_known = false;
+}
+
+void I2C0_Clock_Rate_100khz(){
+	TWI0->TWI_CWGR = 0				// clock waveform generator reg.			pg. 741
+		| TWI_CWGR_CLDIV(208)		// clock low divider
+		| TWI_CWGR_CHDIV(208)		// clock high divider
+		| TWI_CWGR_CKDIV(1)			// clock dividor
+	;
+	i2c0_clock_period_ns_known = false;
+}
+
+void I2C0_Clock_Rate_10khz(){
+	TWI0->TWI_CWGR = 0				// clock waveform generator reg.			pg. 741
+		| TWI_CWGR_CLDIV(131)		// clock low divider
+		| TWI_CWGR_CHDIV(131)		// clock high divider
+		| TWI_CWGR_CKDIV(5)			// clock dividor
+	;
+	i2c0_clock_period_ns_known = false;
+}
+
+void I2C0_Clock_Rate_1000khz(){
+	TWI0->TWI_CWGR = 0				// clock waveform generator reg.			pg. 741
+		| TWI_CWGR_CLDIV(38)		// clock low divider
+		| TWI_CWGR_CHDIV(38)		// clock high divider
+		| TWI_CWGR_CKDIV(0)			// clock dividor
+	;
+	i2c0_clock_period_ns_known = false;
+}
+
+int I2C0_get_Clock_Rate_Period_ns(){
+	
+	if (i2c0_clock_period_ns_known) return i2c0_clock_period_ns;
+	
+	int scale_period = 0;	// period without the microcontroller clock
+	int clock_period = 0;	// period of each I2C clock tick
+	int cldiv = (TWI0->TWI_CWGR & TWI_CWGR_CLDIV(0xFF)) >> 0;
+	int chdiv = (TWI0->TWI_CWGR & TWI_CWGR_CHDIV(0xFF)) >> 8;
+	int ckdiv = (TWI0->TWI_CWGR & TWI_CWGR_CKDIV(0x07)) >> 16;
+	
+	
+	scale_period = (cldiv + chdiv) * (1 << ckdiv) + 8;	// combining SCL high/low periods without microcontroller clock.
+	clock_period = 11.9 * (float) scale_period;
+	
+	i2c0_clock_period_ns = clock_period;				// save the clock period
+	i2c0_clock_period_ns_known = true;
+	
+	return clock_period;
+}
+
 
 // TWCK0 is Peripheral A
 // Arduino Digital Pin D71 (SCL1)
@@ -83,10 +210,9 @@ void setup_PIOA17_as_TWI0_TWD0(){
 	PIOA->PIO_PDR = PIO_PDR_P17;	// disable PIO control of pin. (Peripheral controls it)	pg. 634
 }
 
-// still needs to get done.
-bool I2C0_Enabled_Status(){
-	
-	return false;
+// I2C master status.
+bool I2C0_Master_Enabled_Status(){
+	return TWI0->TWI_CR & TWI_CR_MSEN;		// is master mode enabled?			pg. 736
 }
 
 
@@ -95,6 +221,9 @@ bool I2C0_Enabled_Status(){
 void write_I2C0_blocking(uint8_t devAddress, uint8_t data){
 	// instructions on page 719
 	uint32_t i2c0_status = 0;
+	#ifdef BUS_HANG_DETECTION
+		i2c0_transactionInProgress = true;
+	#endif
 	
 	TWI0->TWI_MMR = 0				// master mode reg.							pg. 738
 		| TWI_MMR_IADRSZ_NONE
@@ -107,19 +236,39 @@ void write_I2C0_blocking(uint8_t devAddress, uint8_t data){
 	TWI0->TWI_THR = TWI_THR_TXDATA(data);	// transmit holding reg.			pg. 749
 	TWI0->TWI_CR = TWI_CR_STOP;				// Send a stop condition			pg. 736
 	
+	#ifdef BUS_HANG_DETECTION
+		int approxTime = I2C0_get_approx_transaction_time_ns(2, 9, 2.5);
+		start_hang_detect_timer_ns(approxTime);
+	#endif
+	
 	do{
 		i2c0_status = TWI0->TWI_SR;				// Read status reg.				pg. 742
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return;
+		#endif
 	} while (!(i2c0_status & TWI_SR_TXRDY));	// run loop until TXRDY is ready (when data transferred from THR to internal shifter)
 	
 	// basically, wait until the transmission is finished.
 	while(!(i2c0_status & TWI_SR_TXCOMP)){		// while transmission is not completed
 		i2c0_status = TWI0->TWI_SR;				// read status reg.					pg. 742
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return;
+		#endif
 	}
+	
+	#ifdef BUS_HANG_DETECTION
+		TC2_2_Stop_Timer();
+		i2c0_transactionInProgress = false;
+		i2c0_transactionSucceeded = true;			// probably not needed here.
+	#endif
 }
 
 void write_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t data){
 	// instructions on page 721
 	uint32_t i2c0_status = 0;
+	#ifdef BUS_HANG_DETECTION
+		i2c0_transactionInProgress = true;
+	#endif
 	
 	TWI0->TWI_MMR = 0				// master mode reg.							pg. 738
 		| TWI_MMR_IADRSZ_1_BYTE		// have an 8-bit (1 byte) register address to write to
@@ -136,26 +285,50 @@ void write_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t data){
 	
 	TWI0->TWI_CR = TWI_CR_STOP;				// Send a stop condition			pg. 736
 	
+	#ifdef BUS_HANG_DETECTION
+		int approxTime = I2C0_get_approx_transaction_time_ns(3, 9, 2.5);
+		start_hang_detect_timer_ns(approxTime);
+	#endif
+	
 	do{											// wait
 		i2c0_status = TWI0->TWI_SR;				// Read status reg.				pg. 742
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return;
+		#endif
 	} while (!(i2c0_status & TWI_SR_TXRDY));	// run loop until TXRDY is ready (when data transferred from THR to internal shifter)
 	
 	// basically, wait until the transmission is finished.
 	while(!(i2c0_status & TWI_SR_TXCOMP)){		// while transmission is not completed
 		i2c0_status = TWI0->TWI_SR;				// read status reg.					pg. 742
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return;
+		#endif
 	}
 	
+	#ifdef BUS_HANG_DETECTION
+		TC2_2_Stop_Timer();
+		i2c0_transactionInProgress = false;
+		i2c0_transactionSucceeded = true;			// probably not needed here.
+	#endif
 }
 
 void write_I2C0_blocking(uint8_t devAddress, uint8_t *buffer, uint16_t count){
 	// instructions on page 721
 	uint32_t i2c0_status = 0;
+	#ifdef BUS_HANG_DETECTION
+		i2c0_transactionInProgress = true;
+	#endif
 	
 	TWI0->TWI_MMR = 0				// master mode reg.							pg. 738
 		| TWI_MMR_IADRSZ_NONE
 		| (0 << 12)					// master write mode
 		| TWI_MMR_DADR(devAddress)	// device address to communicate with
 	;
+	
+	#ifdef BUS_HANG_DETECTION
+		int approxTime = I2C0_get_approx_transaction_time_ns(1 + count, 9, 2.5);
+		start_hang_detect_timer_ns(approxTime);
+	#endif
 	
 	// the start condition isn't need but won't hurt to use it - it is placed automatically either way.
 	TWI0->TWI_CR = TWI_CR_START;	// send start condition.					pg. 736
@@ -164,6 +337,9 @@ void write_I2C0_blocking(uint8_t devAddress, uint8_t *buffer, uint16_t count){
 		
 		do{											// wait
 			i2c0_status = TWI0->TWI_SR;				// Read status reg.				pg. 742
+			#ifdef BUS_HANG_DETECTION
+				if (i2c0_busHanged) return;
+			#endif
 		} while (!(i2c0_status & TWI_SR_TXRDY));	// run loop until TXRDY is ready (when data transferred from THR to internal shifter)
 		
 	}
@@ -173,12 +349,24 @@ void write_I2C0_blocking(uint8_t devAddress, uint8_t *buffer, uint16_t count){
 	// basically, wait until the transmission is finished.
 	while(!(i2c0_status & TWI_SR_TXCOMP)){		// while transmission is not completed
 		i2c0_status = TWI0->TWI_SR;				// read status reg.					pg. 742
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return;
+		#endif
 	}
+	
+	#ifdef BUS_HANG_DETECTION
+		TC2_2_Stop_Timer();
+		i2c0_transactionInProgress = false;
+		i2c0_transactionSucceeded = true;			// probably not needed here.
+	#endif
 }
 
 void write_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t *buffer, uint16_t count){
 	// instructions on page 721
 	uint32_t i2c0_status = 0;
+	#ifdef BUS_HANG_DETECTION
+		i2c0_transactionInProgress = true;
+	#endif
 	
 	TWI0->TWI_MMR = 0				// master mode reg.							pg. 738
 		| TWI_MMR_IADRSZ_1_BYTE		// internal register address
@@ -188,6 +376,11 @@ void write_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t *buffer
 	
 	TWI0->TWI_IADR = TWI_IADR_IADR(regAddress);	// register to write to			pg. 740
 	
+	#ifdef BUS_HANG_DETECTION
+		int approxTime = I2C0_get_approx_transaction_time_ns(2 + count, 9, 2.5);
+		start_hang_detect_timer_ns(approxTime);
+	#endif
+	
 	// the start condition isn't need but won't hurt to use it - it is placed automatically either way.
 	TWI0->TWI_CR = TWI_CR_START;	// send start condition.					pg. 736
 	for (uint16_t i = 0; i < count; i++){
@@ -195,6 +388,9 @@ void write_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t *buffer
 		
 		do{											// wait
 			i2c0_status = TWI0->TWI_SR;				// Read status reg.				pg. 742
+			#ifdef BUS_HANG_DETECTION
+				if (i2c0_busHanged) return;
+			#endif
 		} while (!(i2c0_status & TWI_SR_TXRDY));	// run loop until TXRDY is ready (when data transferred from THR to internal shifter)
 		
 	}
@@ -204,7 +400,16 @@ void write_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t *buffer
 	// basically, wait until the transmission is finished.
 	while(!(i2c0_status & TWI_SR_TXCOMP)){		// while transmission is not completed
 		i2c0_status = TWI0->TWI_SR;				// read status reg.					pg. 742
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return;
+		#endif
 	}
+	
+	#ifdef BUS_HANG_DETECTION
+		TC2_2_Stop_Timer();
+		i2c0_transactionInProgress = false;
+		i2c0_transactionSucceeded = true;			// probably not needed here.
+	#endif
 }
 
 
@@ -216,6 +421,9 @@ uint8_t read_I2C0_blocking(uint8_t devAddress){
 	
 	uint32_t i2c0_status = 0;
 	uint8_t readVal = 0;
+	#ifdef BUS_HANG_DETECTION
+		i2c0_transactionInProgress = true;
+	#endif
 	
 	TWI0->TWI_MMR = 0				// master mode reg.							pg. 738
 		| TWI_MMR_IADRSZ_NONE		// no internal registers to read from
@@ -228,15 +436,32 @@ uint8_t read_I2C0_blocking(uint8_t devAddress){
 		| TWI_CR_STOP
 	;
 	
+	#ifdef BUS_HANG_DETECTION
+		int approxTime = I2C0_get_approx_transaction_time_ns(2, 9, 2.5);
+		start_hang_detect_timer_ns(approxTime);
+	#endif
+	
 	do{											// wait
 		i2c0_status = TWI0->TWI_SR;				// Read status reg.				pg. 742
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return 0;
+		#endif
 	} while (!(i2c0_status & TWI_SR_RXRDY));	// run loop until RXRDY is ready 
 	
 	readVal = TWI0->TWI_RHR;					// receive holding register.	pg. 748
 	
 	while(!(i2c0_status & TWI_SR_TXCOMP)){		// while transmission is not completed
 		i2c0_status = TWI0->TWI_SR;				// read status reg.					pg. 742
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return 0;
+		#endif
 	}
+	
+	#ifdef BUS_HANG_DETECTION
+		TC2_2_Stop_Timer();
+		i2c0_transactionInProgress = false;
+		i2c0_transactionSucceeded = true;			// probably not needed here.
+	#endif
 	return readVal;
 }
 
@@ -244,6 +469,9 @@ uint8_t read_I2C0_blocking(uint8_t devAddress, uint8_t regAddress){
 	// instructions on page 723
 	uint32_t i2c0_status = 0;
 	uint8_t readVal = 0;
+	#ifdef BUS_HANG_DETECTION
+		i2c0_transactionInProgress = true;
+	#endif
 	
 	TWI0->TWI_MMR = 0				// master mode reg.							pg. 738
 		| TWI_MMR_IADRSZ_1_BYTE		// 1 byte of internal address space.
@@ -258,24 +486,43 @@ uint8_t read_I2C0_blocking(uint8_t devAddress, uint8_t regAddress){
 		| TWI_CR_STOP
 	;
 	
+	#ifdef BUS_HANG_DETECTION
+		int approxTime = I2C0_get_approx_transaction_time_ns(4, 9, 2.5);
+		start_hang_detect_timer_ns(approxTime);
+	#endif
+	
 	do{											// wait
 		i2c0_status = TWI0->TWI_SR;				// Read status reg.				pg. 742
-		if (hang_check(1)) return 0;
+		
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return 0;
+		#endif
 	} while (!(i2c0_status & TWI_SR_RXRDY));	// run loop until RXRDY is ready 
-	hang_reset();
+	
 	readVal = TWI0->TWI_RHR;					// receive holding register.	pg. 748
 	
 	while(!(i2c0_status & TWI_SR_TXCOMP)){		// while transmission is not completed
 		i2c0_status = TWI0->TWI_SR;				// read status reg.					pg. 742
-		if (hang_check(1)) return 0;
+		
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return 0;
+		#endif
 	}
-	hang_reset();
+	
+	#ifdef BUS_HANG_DETECTION
+		TC2_2_Stop_Timer();
+		i2c0_transactionInProgress = false;
+		i2c0_transactionSucceeded = true;			// probably not needed here.
+	#endif
 	return readVal;
 }
 
 void read_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t *readBuffer, uint16_t count){
 	// instructions on page 724
 	uint32_t i2c0_status = 0;
+	#ifdef BUS_HANG_DETECTION
+		i2c0_transactionInProgress = true;
+	#endif
 	
 	if (count == 0) return;
 	if (count == 1){
@@ -291,18 +538,24 @@ void read_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t *readBuf
 	
 	TWI0->TWI_IADR = regAddress;	// internal address to read from			pg. 740
 	
-	
 	TWI0->TWI_CR = 0				// send start/stop.							pg. 736
 		| TWI_CR_START
 	;
 	
+	#ifdef BUS_HANG_DETECTION
+		int approxTime = I2C0_get_approx_transaction_time_ns(3 + count, 9, 5);
+		start_hang_detect_timer_ns(approxTime);
+	#endif
+	
 	for (uint16_t i = 0; i < count; i++){
 		do{											// wait
 			i2c0_status = TWI0->TWI_SR;				// Read status reg.				pg. 742
-			if (hang_check(1)) return;
 			
+			#ifdef BUS_HANG_DETECTION
+				if (i2c0_busHanged) return;
+			#endif
 		} while (!(i2c0_status & TWI_SR_RXRDY));	// run loop until RXRDY is ready 
-		hang_reset();
+		
 		readBuffer[i] = TWI0->TWI_RHR;				// receive holding register.	pg. 748
 		
 		if (i == (count - 2)){						// one more data to read
@@ -312,21 +565,22 @@ void read_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t *readBuf
 	
 	while(!(i2c0_status & TWI_SR_TXCOMP)){		// while transmission is not completed
 		i2c0_status = TWI0->TWI_SR;				// read status reg.					pg. 742
-		if(hang_check(2)) return;
+		
+		#ifdef BUS_HANG_DETECTION
+			if (i2c0_busHanged) return;
+		#endif
 	}
-	hang_reset();
 	
+	#ifdef BUS_HANG_DETECTION
+		TC2_2_Stop_Timer();
+		i2c0_transactionInProgress = false;
+		i2c0_transactionSucceeded = true;			// probably not needed here.
+	#endif
 }
 
 
-
-
-
-
-
-
-
 // write/read through i2c (non-blocking)
+
 bool is_I2C0_Transmit_Available(){
 	
 	return false;
@@ -367,10 +621,99 @@ void I2C0_Disable_Int_RXRDY(){
 }
 
 
+// *** I2C0 bus hang detection/recovery *** //
+
+int I2C0_get_approx_transaction_time_ns(int numItems, int bitsPerItem, float scale){
+	// numItems: number of "bytes" of data
+	// scale: amount to scale the time by to take clock stretching into account
+	return scale * (float)(I2C0_get_Clock_Rate_Period_ns() * numItems * bitsPerItem);
+}
+
+void start_hang_detect_timer_ns(int expire_ns){
+	TC2_2_interrupt_in_x_us(expire_ns / 1000.0);
+}
+
+void disable_hang_detect_timer(){
+	TC2_2_disable_interrupts();
+}
+
+// executed by the ISR.
+void hang_detected(){
+	i2c0_busHanged = true;
+	i2c0_transactionInProgress = false;
+	i2c0_transactionSucceeded = false;
+}
+
+bool I2C0_transactionSucceeded(){
+	return i2c0_transactionSucceeded;
+}
 
 
+// timer setup for making interrupts to detect the bus hang.
+// remember: Arduino due timers notations are kinda weird.
+// There timers: TC0, TC1, and TC2. each of them has 3 channels.
+// for interrupts, they are labeled from TC0 to TC8.
 
+void setup_TC2_2_for_interrupts(){
+	// Instance Name: TC8
+	// Instance Id: 35
+	
+	uint32_t temp = 0;
+	
+	NVIC_SetPriority(TC8_IRQn, 1);		// set priority of interrupt			pg. 164
+	NVIC_DisableIRQ(TC8_IRQn);			// disable the IRQ for setup			pg. 164
+	
+	PMC->PMC_PCER1 = PMC_PCER1_PID35;		// enable clock for TC8				pg. 39, 563
+	TC2->TC_WPMR = TC_WPMR_WPKEY(0x54494D);	// unlock write protect				pg. 908
+	
+	TC2->TC_CHANNEL[2].TC_CCR = TC_CCR_CLKDIS;	// Disable the clock.			pg. 880
+	TC2->TC_CHANNEL[2].TC_CMR = 0			// 									pg. 883
+		| TC_CMR_TCCLKS_TIMER_CLOCK1		// clock: MCK / 2
+		| TC_CMR_BURST_NONE
+		| TC_CMR_CPCSTOP					// stop timer when reaches RC
+		| TC_CMR_WAVSEL_UP_RC				// Up mode with trigger on RC (for interrupt)
+		| TC_CMR_WAVE						// Waveform mode
+	;
+	
+	TC2->TC_CHANNEL[2].TC_IDR = 0xFF;		// disable all interrupts.			pg. 896
+	temp = TC2->TC_CHANNEL[2].TC_SR;		// read/clear status register.
+	
+	TC2->TC_CHANNEL[2].TC_CCR = TC_CCR_CLKEN;	// Enables the clock.			pg. 880
+	
+	NVIC_EnableIRQ(TC8_IRQn);			// enable the IRQ						pg. 164
+}
 
+void TC2_2_interrupt_in_x_us(uint32_t fire_us){
+	TC2->TC_CHANNEL[2].TC_RC = fire_us * 42;	// interrupt in x us.					pg. 891
+	uint32_t temp = TC2->TC_CHANNEL[2].TC_SR;	//read/clear status reg.		pg. 892
+	TC2->TC_CHANNEL[2].TC_IER = TC_IER_CPCS;	// interrupt on RC Compare		pg. 894
+	TC2->TC_CHANNEL[2].TC_CCR = 0				// start the clock.				pg. 880
+		| TC_CCR_SWTRG				// software trigger - start timer
+		| TC_CCR_CLKEN				// enable the clock.
+	;	
+}
+
+void TC2_2_enable_interrupts(){
+	TC2->TC_CHANNEL[2].TC_IER = TC_IER_CPCS;	// interrupt on RC Compare		pg. 894
+}
+
+void TC2_2_disable_interrupts(){
+	TC2->TC_CHANNEL[2].TC_IDR = TC_IDR_CPCS;	// disable interrupt on RC Compare	pg. 896
+}
+
+void TC2_2_Stop_Timer(){
+	TC2->TC_CHANNEL[2].TC_CCR = TC_CCR_CLKDIS;	// disable the clock			pg. 880
+	TC2->TC_CHANNEL[2].TC_IDR = TC_IDR_CPCS;	// disable interrupt on RC Compare	pg. 896
+}
+
+void TC8_Handler(){
+	uint32_t TC2_2_IMR = TC2->TC_CHANNEL[2].TC_IMR;	// read mask reg.			pg. 898
+	uint32_t TC2_2_SR = TC2->TC_CHANNEL[2].TC_SR;	// read/clear status reg.	pg. 892
+	
+	if ((TC2_2_IMR | TC2_2_SR) & TC_IMR_CPCS){		// ??
+		hang_detected();
+	}
+}
 
 
 
