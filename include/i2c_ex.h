@@ -1,9 +1,8 @@
 #ifndef I2C_EX_H
 #define I2C_EX_H
 
-
-
 #include <Arduino.h>
+#include "timer_counter.h"
 
 /*
 i2c in master mode.
@@ -60,12 +59,22 @@ void start_hang_detect_timer_ns(int expire_ns);
 void disable_hang_detect_timer();
 void hang_detected();
 bool I2C0_transactionSucceeded();
+bool I2C0_isBusHanged();
+int I2C0_checkHangType();
+bool I2C0_FreeBusHang();
+void I2C0_generateStartStop();
 // hardware specific functions for i2c0 bus hang detection
 void setup_TC2_2_for_interrupts();
 void TC2_2_interrupt_in_x_us(uint32_t fire_us);
 void TC2_2_enable_interrupts();
 void TC2_2_disable_interrupts();
 void TC2_2_Stop_Timer();
+bool I2C0_getSclValue();
+bool I2C0_getSdaValue();
+void setup_PIOA18_TWCKL0_as_OpenDrain_Output();
+void set_PIOA18_TWCKL0_value(bool high);
+void setup_PIOA17_TWD0_as_OpenDrain_Output();
+void set_PIOA17_TWD0_value(bool high);
 
 /*
 

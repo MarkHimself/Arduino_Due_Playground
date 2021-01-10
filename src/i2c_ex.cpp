@@ -193,6 +193,7 @@ void setup_PIOA18_as_TWI0_TWCK0(){
 	PMC->PMC_PCER0 = PMC_PCER0_PID11;	// enable clock for PIOA				pg. 542
 	PIOA->PIO_WPMR = 0x50494F;			// unlock write protect					pg. 674
 	
+	PIOA->PIO_MDDR = PIO_MDDR_P18;		// disable open-drain					pg. 651
 	PIOA->PIO_PUER = PIO_PUER_P18;		// enable pull up						pg. 654
 	PIOA->PIO_ABSR = PIOA->PIO_ABSR & (~PIO_ABSR_P25);	// 0 = Peripheral A		pg. 656
 	PIOA->PIO_PDR = PIO_PDR_P18;	// disable PIO control of pin. (Peripheral controls it)	pg. 634
@@ -205,6 +206,7 @@ void setup_PIOA17_as_TWI0_TWD0(){
 	PMC->PMC_PCER0 = PMC_PCER0_PID11;	// enable clock for PIOA				pg. 542
 	PIOA->PIO_WPMR = 0x50494F;			// unlock write protect					pg. 674
 	
+	PIOA->PIO_MDDR = PIO_MDDR_P17;		// disable open-drain					pg. 651
 	PIOA->PIO_PUER = PIO_PUER_P17;		// enable pull up						pg. 655
 	PIOA->PIO_ABSR = PIOA->PIO_ABSR & (~PIO_ABSR_P17);	// 0 = Peripheral A		pg. 656
 	PIOA->PIO_PDR = PIO_PDR_P17;	// disable PIO control of pin. (Peripheral controls it)	pg. 634
@@ -575,6 +577,7 @@ void read_I2C0_blocking(uint8_t devAddress, uint8_t regAddress, uint8_t *readBuf
 		TC2_2_Stop_Timer();
 		i2c0_transactionInProgress = false;
 		i2c0_transactionSucceeded = true;			// probably not needed here.
+		i2c0_busHanged = false;						// ??
 	#endif
 }
 
@@ -648,6 +651,108 @@ bool I2C0_transactionSucceeded(){
 	return i2c0_transactionSucceeded;
 }
 
+bool I2C0_isBusHanged(){
+	return i2c0_busHanged;
+}
+
+// Determine the hang type
+int I2C0_checkHangType(){
+	
+	bool scl = I2C0_getSclValue();
+	bool sda = I2C0_getSdaValue();
+	
+	if (scl & sda){
+		i2c0_hangType = 1;
+	}
+	else if (scl & !sda){
+		i2c0_hangType = 2;
+	}
+	else if (!scl & sda){
+		i2c0_hangType = 3;
+	}
+	else{
+		i2c0_hangType = 4;
+	}
+	return i2c0_hangType;
+}
+
+bool I2C0_FreeBusHang(){
+	
+	bool busFreed = false;
+	uint32_t i2c0_twi_cwgr = TWI0->TWI_CWGR;	// save the i2c clock rate		pg. 741
+	
+	if (i2c0_hangType == 0) return true;
+	
+	TWI0->TWI_CR = TWI_CR_SWRST;	// Reset TWI0								pg. 736
+	
+	setup_PIOA18_TWCKL0_as_OpenDrain_Output();
+	setup_PIOA17_TWD0_as_OpenDrain_Output();
+	set_PIOA18_TWCKL0_value(true);
+	set_PIOA17_TWD0_value(true);
+	
+	if (i2c0_hangType == 2 || i2c0_hangType == 1){
+		for (int i = 0; i < 30; ++i){
+			set_PIOA18_TWCKL0_value(false);
+			delay_ms(1);
+			set_PIOA18_TWCKL0_value(true);
+			delay_ms(1);
+		}
+		if (I2C0_getSclValue() && I2C0_getSdaValue()){
+			I2C0_generateStartStop();		// generate stop.
+			// check scl/sda values
+			if (I2C0_getSclValue() && I2C0_getSdaValue()){
+				busFreed = true;
+			}
+		}
+	}
+	else if (i2c0_hangType == 3){
+		for (int i = 0; i < 10; ++i){
+			set_PIOA17_TWD0_value(false);
+			delay_ms(1);
+			set_PIOA17_TWD0_value(true);
+			delay_ms(1);
+		}for (int i = 0; i < 10; ++i){
+			set_PIOA18_TWCKL0_value(false);
+			delay_ms(1);
+			set_PIOA18_TWCKL0_value(true);
+			delay_ms(1);
+		}
+		if (I2C0_getSclValue() && I2C0_getSdaValue()){
+			I2C0_generateStartStop();		// generate stop.
+			// check scl/sda values
+			if (I2C0_getSclValue() && I2C0_getSdaValue()){
+				busFreed = true;
+			}
+		}
+	}
+	else if (i2c0_hangType == 4){	// can't do much in here.
+		delay_ms(1);				// let's hope its the microcontroller that froze and this fixes it.
+		if (I2C0_getSclValue() && I2C0_getSdaValue()){
+			I2C0_generateStartStop();		// generate stop.
+			// check scl/sda values
+			if (I2C0_getSclValue() && I2C0_getSdaValue()){
+				busFreed = true;
+			}
+		}
+	}
+	
+	setup_I2C0_master();				// setup i2c
+	TWI0->TWI_CWGR = i2c0_twi_cwgr;		// set clock to previous value			pg. 736
+	i2c0_busHanged = !busFreed;
+	
+	setup_PIOA18_as_TWI0_TWCK0();
+	setup_PIOA17_as_TWI0_TWD0();
+	return busFreed;
+}
+
+void I2C0_generateStartStop(){
+	// generate stop condition on the bus
+	set_PIOA17_TWD0_value(false);	// start condition
+	delay_ms(1);
+	set_PIOA17_TWD0_value(true);	// stop condition
+	delay_ms(1);
+}
+
 
 // timer setup for making interrupts to detect the bus hang.
 // remember: Arduino due timers notations are kinda weird.
@@ -706,6 +811,12 @@ void TC2_2_Stop_Timer(){
 	TC2->TC_CHANNEL[2].TC_IDR = TC_IDR_CPCS;	// disable interrupt on RC Compare	pg. 896
 }
 
+/*
+is it possible for the i2c_done interrupt to execute while inside of here and therefore creating
+a critical race condition. a hang will be detected and the transfer complete will be set.
+should i disable interrupts while inside of here (and in i2c done interrupt)
+and then verify that transfer is not complete. ?
+*/
 void TC8_Handler(){
 	uint32_t TC2_2_IMR = TC2->TC_CHANNEL[2].TC_IMR;	// read mask reg.			pg. 898
 	uint32_t TC2_2_SR = TC2->TC_CHANNEL[2].TC_SR;	// read/clear status reg.	pg. 892
@@ -715,8 +826,37 @@ void TC8_Handler(){
 	}
 }
 
+// PIOA 18
+bool I2C0_getSclValue(){
+	return PIOA->PIO_PDSR & PIO_PDSR_P18;		// I/O level					pg. 645
+}
 
+// PIOA 17
+bool I2C0_getSdaValue(){
+	return PIOA->PIO_PDSR & PIO_PDSR_P17;		// I/O level					pg. 645
+}
 
+void setup_PIOA18_TWCKL0_as_OpenDrain_Output(){
+	PIOA->PIO_MDDR = PIO_MDDR_P18;		// enable open drain					pg. 650
+	PIOA->PIO_PER = PIO_PER_P18;		// PIO controls pin						pg. 633
+	PIOA->PIO_OER = PIO_OER_P18;		// enable pin output					pg. 636
+}
+
+void set_PIOA18_TWCKL0_value(bool high){
+	if (high) 	PIOA->PIO_SODR = PIO_SODR_P18;		// set high (open-drain)	pg. 642
+	else 		PIOA->PIO_CODR = PIO_CODR_P18;		// set low					pg. 643
+}
+
+void setup_PIOA17_TWD0_as_OpenDrain_Output(){
+	PIOA->PIO_MDDR = PIO_MDDR_P17;		// enable open drain					pg. 650
+	PIOA->PIO_PER = PIO_PER_P17;		// PIO controls pin						pg. 633
+	PIOA->PIO_OER = PIO_OER_P17;		// enable pin output					pg. 636
+}
+
+void set_PIOA17_TWD0_value(bool high){
+	if (high) 	PIOA->PIO_SODR = PIO_SODR_P17;		// set high (open-drain)	pg. 642
+	else 		PIOA->PIO_CODR = PIO_CODR_P17;		// set low					pg. 643
+}
 
 
 
